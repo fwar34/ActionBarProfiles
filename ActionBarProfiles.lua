@@ -4,6 +4,7 @@
 
 local ABP_PlayerName = nil
 local MAX_ACTIONS = 144
+local ABP_SavingInProgress = false -- 保存/加载动作条期间抑制变化事件，防止自触发自动保存
 
 local CMD_SAVE   = "保存"
 local CMD_LOAD   = "加载"
@@ -49,7 +50,7 @@ local function ABP_TooltipAttach()
     end
 end
 
-function ABP_SaveProfile(profileName)
+function ABP_SaveProfile(profileName, silent)
     if not profileName or profileName == "" then return end
     if not ABP_PlayerName then return end
     if not ABP_Layout then ABP_Layout = {} end
@@ -66,6 +67,7 @@ function ABP_SaveProfile(profileName)
     local scStatus = GetCVar("autoSelfCast")
     SetCVar("autoSelfCast", 0)
 
+    ABP_SavingInProgress = true
     for i = 1, MAX_ACTIONS do
         if HasAction(i) then
             local macroName = GetActionText(i)
@@ -84,10 +86,12 @@ function ABP_SaveProfile(profileName)
 
                 if isSpell then
                     local spellName, rankText = ABP_GetTooltipLine1()
-                    ABP_Layout[ABP_PlayerName][profileName].spells[i] = {
-                        name = spellName,
-                        rank = rankText,
-                    }
+                    if spellName and spellName ~= "" then
+                        ABP_Layout[ABP_PlayerName][profileName].spells[i] = {
+                            name = spellName,
+                            rank = rankText,
+                        }
+                    end
                 else
                     local itemName = (select(1, ABP_GetTooltipLine1()))
                     if itemName and itemName ~= "" then
@@ -97,9 +101,12 @@ function ABP_SaveProfile(profileName)
             end
         end
     end
+    ABP_SavingInProgress = false
 
     SetCVar("autoSelfCast", scStatus)
-    ABP_Msg('配置文件 "' .. profileName .. '" 已保存.')
+    if not silent then
+        ABP_Msg('配置文件 "' .. profileName .. '" 已保存.')
+    end
 end
 
 local function ABP_BuildNeededSpellMap(neededSpellKeys)
@@ -231,6 +238,7 @@ function ABP_LoadProfile(profileName)
     local scStatus = GetCVar("autoSelfCast")
     SetCVar("autoSelfCast", 0)
 
+    ABP_SavingInProgress = true
     for i = 1, MAX_ACTIONS do
         repeat
             local sp = spells[i]
@@ -278,8 +286,13 @@ function ABP_LoadProfile(profileName)
                 end
                 break
             end
+
+            -- 保存的配置中该槽位为空：拾起当前动作并丢弃，实现完全覆盖
+            PickupAction(i)
+            ClearCursor()
         until true
     end
+    ABP_SavingInProgress = false
 
     SetCVar("autoSelfCast", scStatus)
     ABP_Msg('配置文件 "' .. profileName .. '" 已加载.')
@@ -308,8 +321,56 @@ function ABP_RemoveProfile(profileName)
     ABP_Msg("配置文件 '" .. profileName .. "' 已经删除.")
 end
 
+-- 自动保存配置名：职业+角色名
+function ABP_GetAutoProfileName()
+    if not ABP_PlayerName then return nil end
+    local className = UnitClass("player")
+    local playerName = UnitName("player")
+    if not className or className == "" or not playerName or playerName == "" then return nil end
+    return className .. playerName
+end
+
+-- 执行自动保存（保存到 "职业+角色名" 配置）
+function ABP_AutoSaveProfile()
+    local profileName = ABP_GetAutoProfileName()
+    if not profileName then return nil end
+    ABP_SaveProfile(profileName)
+    return profileName
+end
+
+-- 事件驱动：动作条内容变化后，等待 5 秒无再次变化才自动保存（防抖，避免频繁保存）
+local ABP_PendingSave = false
+local ABP_LastChangeTime = 0
+local ABP_DebounceInterval = 5 -- 防抖间隔（秒）
+
+function ABP_OnActionBarChanged()
+    if not ABP_PlayerName or ABP_SavingInProgress then return end
+    ABP_PendingSave = true
+    ABP_LastChangeTime = GetTime()
+end
+
+-- 由独立计时帧每帧驱动：变化后安静满 5 秒才保存一次
+function ABP_OnUpdate(frame, elapsed)
+    if not ABP_PlayerName or not ABP_PendingSave then return end
+    if GetTime() - ABP_LastChangeTime >= ABP_DebounceInterval then
+        ABP_PendingSave = false
+        ABP_AutoSaveProfile()
+    end
+end
+
+-- 创建独立的自动保存计时帧
+function ABP_CreateTimerFrame()
+    if ABP_TimerFrame then return end
+    ABP_TimerFrame = CreateFrame("Frame", "ABP_TimerFrame", UIParent)
+    ABP_TimerFrame:SetScript("OnUpdate", ABP_OnUpdate)
+    ABP_TimerFrame:Show()
+end
+
 function ABP_OnLoad()
     this:RegisterEvent("VARIABLES_LOADED")
+    this:RegisterEvent("ACTIONBAR_SLOT_CHANGED")
+    this:RegisterEvent("UPDATE_BONUS_ACTIONBAR")
+    this:RegisterEvent("UPDATE_MULTI_CAST_ACTIONBAR")
     SLASH_ABP1 = "/ABP"
     SlashCmdList["ABP"] = function(msg) ABP_SlashCommand(msg or "") end
 end
@@ -325,6 +386,9 @@ function ABP_OnEvent()
 
         UIDropDownMenu_Initialize(getglobal("ABP_DropDownMenu"), ABP_DropDownMenu_OnLoad, "MENU")
         ABPButton_UpdatePosition()
+        ABP_CreateTimerFrame()
+    elseif event == "ACTIONBAR_SLOT_CHANGED" or event == "UPDATE_BONUS_ACTIONBAR" or event == "UPDATE_MULTI_CAST_ACTIONBAR" then
+        ABP_OnActionBarChanged()
     end
 end
 
