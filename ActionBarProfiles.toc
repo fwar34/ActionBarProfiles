@@ -1,0 +1,13 @@
+## Interface: 11200
+## Title:|CFF33AAFF[辅助]|R动作条保存
+## Notes:保存和加载动作条配置
+## Author: Ermean <Vanguard>, Emerald Dream 1.12.1, Feenix
+## Version: 2.1
+## SavedVariables: ABP_Layout, ABP_ButtonPosition
+ActionBarProfiles.lua
+ActionBarProfiles.xml
+
+## X-PluginId: 150
+## X-PublishTime: 2026-08-07 13:34:03
+## X-Version: 20260807001
+## X-OverrideMode: 2
