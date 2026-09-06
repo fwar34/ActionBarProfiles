@@ -342,8 +342,12 @@ end
 local ABP_PendingSave = false
 local ABP_LastChangeTime = 0
 local ABP_DebounceInterval = 5 -- 防抖间隔（秒）
+local ABP_StartupDelay = 30 -- 登录/重载后的静默窗口期（秒），避免客户端初始化动作条时误触发保存
+local ABP_StartupTime = 0
 
 function ABP_OnActionBarChanged()
+    -- 静默窗口期内忽略动作条变化，防止登录时客户端恢复动作条覆盖已有配置
+    if GetTime() - ABP_StartupTime < ABP_StartupDelay then return end
     if not ABP_PlayerName or ABP_SavingInProgress then return end
     ABP_PendingSave = true
     ABP_LastChangeTime = GetTime()
@@ -378,6 +382,7 @@ end
 function ABP_OnEvent()
     if event == "VARIABLES_LOADED" then
         ABP_PlayerName = UnitName("player") .. " of " .. GetCVar("realmName")
+        ABP_StartupTime = GetTime() -- 记录静默窗口期起点
 
         if not ABP_Layout then ABP_Layout = {} end
         if not ABP_Layout[ABP_PlayerName] then ABP_Layout[ABP_PlayerName] = {} end
