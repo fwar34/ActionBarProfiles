@@ -263,6 +263,7 @@ function ABP_LoadProfile(profileName)
                 if sid then
                     PickupSpell(sid, BOOKTYPE_SPELL)
                     PlaceAction(i)
+                    ClearCursor() -- 清空光标，防止被覆盖槽位的旧内容残留并干扰后续槽位
                 end
                 break
             end
@@ -273,12 +274,14 @@ function ABP_LoadProfile(profileName)
                 if GetSuperMacroInfo and GetSuperMacroInfo(mname, "texture") then
                     PickupMacro(0, mname)
                     PlaceAction(i)
+                    ClearCursor() -- 清空光标残留
                     picked = true
                 else
                     local idx = GetMacroIndexByName(mname)
                     if idx and idx > 0 then
                         PickupMacro(idx)
                         PlaceAction(i)
+                        ClearCursor() -- 清空光标残留
                         picked = true
                     end
                 end
@@ -291,12 +294,14 @@ function ABP_LoadProfile(profileName)
                 if eslot then
                     PickupInventoryItem(eslot)
                     PlaceAction(i)
+                    ClearCursor() -- 清空光标残留
                     break
                 end
                 local loc = bagItemToLoc[iname]
                 if loc then
                     PickupContainerItem(loc.bag, loc.slot)
                     PlaceAction(i)
+                    ClearCursor() -- 清空光标残留
                     break
                 end
                 break
