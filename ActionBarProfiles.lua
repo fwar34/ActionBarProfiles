@@ -2,15 +2,18 @@
 -- 经过Sunelgy优化的轻量版本：按需扫描 / 降低Tooltip与拾取操作 / 避免不必要表分配
 -- 作者：Sunelgy在原作者基础上优化，武藤纯子酱修复宏逻辑
 
-local ABP_PlayerName = nil
-local MAX_ACTIONS = 144
+-- 全局状态与常量定义
+local ABP_PlayerName = nil -- 当前角色标识：角色名 of 服务器名
+local MAX_ACTIONS = 144 -- 最大动作槽数量
 local ABP_SavingInProgress = false -- 保存/加载动作条期间抑制变化事件，防止自触发自动保存
 
+-- 斜杠命令关键字（中文）
 local CMD_SAVE   = "保存"
 local CMD_LOAD   = "加载"
 local CMD_REMOVE = "删除"
 local CMD_LIST   = "列表"
 
+-- 判断表中是否有元素（用于空配置检测）
 local function hasElements(T)
     if type(T) ~= "table" then return 0 end
     for _ in pairs(T) do
@@ -19,6 +22,7 @@ local function hasElements(T)
     return 0
 end
 
+-- 安全读取工具 Tooltip 第一行文本，返回 (左文本, 右文本)
 local function ABP_GetTooltipLine1()
     local left, right = nil, nil
     if ABP_TooltipTextLeft1 and ABP_TooltipTextLeft1:IsShown() then
@@ -30,6 +34,7 @@ local function ABP_GetTooltipLine1()
     return left, right
 end
 
+-- 组合"技能名 + 等级"作为唯一键（等级为空时仅用技能名）
 local function ABP_ComposeSpellKey(name, rankText)
     if not name or name == "" then return nil end
     if rankText and rankText ~= "" then
@@ -38,18 +43,22 @@ local function ABP_ComposeSpellKey(name, rankText)
     return name
 end
 
+-- 向默认聊天框输出消息
 local function ABP_Msg(msg)
     if DEFAULT_CHAT_FRAME and msg then
         DEFAULT_CHAT_FRAME:AddMessage(msg)
     end
 end
 
+-- 将工具 Tooltip 绑定到 UIParent（供保存/加载时探测动作与物品名称）
 local function ABP_TooltipAttach()
     if ABP_Tooltip and ABP_Tooltip.SetOwner then
         ABP_Tooltip:SetOwner(UIParent, "ANCHOR_NONE")
     end
 end
 
+-- 保存当前动作条到指定配置
+-- 逐个扫描动作槽：宏 -> 技能 -> 物品，分别存入对应子表；silent 为 true 时不输出提示
 function ABP_SaveProfile(profileName, silent)
     if not profileName or profileName == "" then return end
     if not ABP_PlayerName then return end
@@ -109,6 +118,7 @@ function ABP_SaveProfile(profileName, silent)
     end
 end
 
+-- 扫描法术书，构建"技能键(名+等级) -> 法术ID"映射（只找需要的技能，找到全部即停）
 local function ABP_BuildNeededSpellMap(neededSpellKeys)
     local result = {}
     if not neededSpellKeys or not next(neededSpellKeys) then return result end
@@ -139,6 +149,7 @@ local function ABP_BuildNeededSpellMap(neededSpellKeys)
     return result
 end
 
+-- 遍历 19 个装备位，构建"物品名 -> 装备槽位"映射（找齐即停）
 local function ABP_FindItemsInEquipment(neededItems)
     local equipMap = {}
     if not neededItems or not next(neededItems) then return equipMap end
@@ -166,6 +177,7 @@ local function ABP_FindItemsInEquipment(neededItems)
     return equipMap
 end
 
+-- 遍历背包与随身包，构建"物品名 -> {bag, slot}"映射（找齐即停）
 local function ABP_FindItemsInBags(neededItems)
     local bagMap = {}
     if not neededItems or not next(neededItems) then return bagMap end
@@ -199,6 +211,8 @@ local function ABP_FindItemsInBags(neededItems)
     return bagMap
 end
 
+-- 加载配置到动作条（完全覆盖当前布局）
+-- 先预构建技能/物品映射表，再按槽位回填；配置中为空的槽位会被清空
 function ABP_LoadProfile(profileName)
     if not ABP_PlayerName or not ABP_Layout or not ABP_Layout[ABP_PlayerName]
        or not ABP_Layout[ABP_PlayerName][profileName] then
@@ -226,11 +240,12 @@ function ABP_LoadProfile(profileName)
     local equipItemToId  = ABP_FindItemsInEquipment(neededItemNames)
 
     do
+        -- 只在装备位上找不到的物品，才继续去背包里找
         local remaining = {}
         for name in pairs(neededItemNames) do
             if not equipItemToId[name] then remaining[name] = true end
         end
-        var_bagMap = ABP_FindItemsInBags(remaining)
+        var_bagMap = ABP_FindItemsInBags(remaining) -- 遗留的全局变量，仅作返回值暂存
     end
     local bagItemToLoc = var_bagMap or {}
 
@@ -298,6 +313,7 @@ function ABP_LoadProfile(profileName)
     ABP_Msg('配置文件 "' .. profileName .. '" 已加载.')
 end
 
+-- 列出当前角色的所有配置名
 function ABP_ListProfiles()
     if not ABP_PlayerName or not ABP_Layout or not ABP_Layout[ABP_PlayerName]
        or hasElements(ABP_Layout[ABP_PlayerName]) == 0 then
@@ -310,6 +326,7 @@ function ABP_ListProfiles()
     end
 end
 
+-- 删除指定配置
 function ABP_RemoveProfile(profileName)
     if not ABP_PlayerName or not ABP_Layout
        or not ABP_Layout[ABP_PlayerName]
@@ -370,15 +387,17 @@ function ABP_CreateTimerFrame()
     ABP_TimerFrame:Show()
 end
 
+-- 插件加载：注册事件与斜杠命令
 function ABP_OnLoad()
     this:RegisterEvent("VARIABLES_LOADED")
     this:RegisterEvent("ACTIONBAR_SLOT_CHANGED")
     this:RegisterEvent("UPDATE_BONUS_ACTIONBAR")
     this:RegisterEvent("UPDATE_MULTI_CAST_ACTIONBAR")
-    SLASH_ABP1 = "/ABP"
+    SLASH_ABP1 = "/abprofile"
     SlashCmdList["ABP"] = function(msg) ABP_SlashCommand(msg or "") end
 end
 
+-- 事件分发：VARIABLES_LOADED 时初始化，动作条变化事件转发给自动保存防抖逻辑
 function ABP_OnEvent()
     if event == "VARIABLES_LOADED" then
         ABP_PlayerName = UnitName("player") .. " of " .. GetCVar("realmName")
@@ -397,14 +416,15 @@ function ABP_OnEvent()
     end
 end
 
+-- 斜杠命令分发：解析"保存/加载/删除/列表 + 配置名"并调用对应函数
 function ABP_SlashCommand(msg)
     msg = msg or ""
     if msg == "" then
         ABP_Msg("ActionBarProfiles, 由Kronos的<Vanguard>制作, 60addons汉化")
-        ABP_Msg("/abp 保存 [配置文件名字]")
-        ABP_Msg("/abp 加载 [配置文件名字]")
-        ABP_Msg("/abp 删除 [配置文件名字]")
-        ABP_Msg("/abp 列表")
+        ABP_Msg("/abprofile 保存 [配置文件名字]")
+        ABP_Msg("/abprofile 加载 [配置文件名字]")
+        ABP_Msg("/abprofile 删除 [配置文件名字]")
+        ABP_Msg("/abprofile 列表")
         return
     end
 
@@ -426,6 +446,8 @@ function ABP_SlashCommand(msg)
     end
 end
 
+-- 构建小地图按钮的下拉菜单
+-- 含三级：主菜单（加载/保存/删除）、保存子菜单、删除子菜单
 function ABP_DropDownMenu_OnLoad()
     if UIDROPDOWNMENU_MENU_VALUE == "Delete menu" then
         UIDropDownMenu_AddButton({
@@ -524,8 +546,10 @@ function ABP_DropDownMenu_OnLoad()
     }, UIDROPDOWNMENU_MENU_LEVEL)
 end
 
+-- 小地图按钮绕小地图旋转的半径
 local ABP_ButtonRadius = 78
 
+-- 按保存的角度定位小地图按钮
 function ABPButton_UpdatePosition()
     ActionBarProfiles_IconFrame:SetPoint(
         "TOPLEFT", "Minimap", "TOPLEFT",
@@ -534,6 +558,7 @@ function ABPButton_UpdatePosition()
     )
 end
 
+-- 按钮被拖动时：根据鼠标相对小地图的位置实时计算角度
 function ABPButton_BeingDragged()
     local xpos, ypos = GetCursorPosition()
     local xmin, ymin = Minimap:GetLeft(), Minimap:GetBottom()
@@ -542,12 +567,14 @@ function ABPButton_BeingDragged()
     ABPButton_SetPosition(math.deg(math.atan2(ypos, xpos)))
 end
 
+-- 设置按钮角度（0~360）并持久化，随后更新按钮位置
 function ABPButton_SetPosition(v)
     if v < 0 then v = v + 360 end
     ABP_ButtonPosition = v
     ABPButton_UpdatePosition()
 end
 
+-- 新建配置名的输入对话框（菜单"新建..."触发）
 StaticPopupDialogs["ABP_NewProfile"] = {
     text = "为当前动作条保存输入一个名称",
     button1 = SAVE,
