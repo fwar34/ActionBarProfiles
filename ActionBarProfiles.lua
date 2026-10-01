@@ -6,12 +6,38 @@
 local ABP_PlayerName = nil -- 当前角色标识：角色名 of 服务器名
 local MAX_ACTIONS = 144 -- 最大动作槽数量
 local ABP_SavingInProgress = false -- 保存/加载动作条期间抑制变化事件，防止自触发自动保存
+-- 客户端会把 ACTIONBAR_SLOT_CHANGED 延后派发：保存/加载结束后标志位已复位，
+-- 但这些延迟事件才刚到达，仅靠标志位无法拦住，会形成“自己触发自己保存”的循环。
+-- 因此再用一个时间窗口兜底，见 ABP_SelfChangeUntil。
+local ABP_SelfChangeUntil = 0 -- 自身改动后继续忽略变化事件的截止时间（GetTime 基准）
+local ABP_SelfChangeGrace = 1 -- 该窗口的时长（秒）
+local ABP_DebugLevel = 0 -- 诊断输出级别：0=关，1=按防抖窗口汇总，2=事件逐条打印
+-- 诊断统计（仅运行时）：事件按"接受 / 被忽略"计数，最后汇总成一行，避免逐条刷屏
+local ABP_StatAccepted = 0
+local ABP_StatIgnoredSelf = 0
+local ABP_StatIgnoredStartup = 0
+local ABP_StatIgnoredNoise = 0 -- 被廉价指纹判定为"内容没变"而丢掉的噪音事件
+local ABP_StatFirstAccepted = nil
+local ABP_FirstWorldEnter = true -- 本次登录/重载是否还没进过世界
+-- 每个槽位的"廉价指纹"（动作文字 + 图标）：用来 O(1) 判断某个动作条事件是不是真的改了内容。
+-- 拾取/采药等背包变动后客户端补发的 ACTIONBAR_SLOT_CHANGED 不会让它变化，于是被直接丢掉。
+local ABP_SlotTexture = {}
+local ABP_SlotMacro = {}
+local ABP_CacheDirty = true -- 需要重建廉价指纹（登录、加载配置、换页/换形态之后）
+
+-- 自动保存的防抖与登录静默窗口（保存任务 ABP_RunSaveJob 也会用到，故提前声明）
+local ABP_PendingSave = false -- 是否有待保存的变化
+local ABP_LastChangeTime = 0 -- 最近一次被接受的变化时间
+local ABP_DebounceInterval = 5 -- 防抖间隔（秒）
+local ABP_StartupDelay = 30 -- 登录/重载后的静默窗口期（秒）
+local ABP_StartupTime = 0 -- 静默窗口计时起点
 
 -- 斜杠命令关键字（中文）
 local CMD_SAVE   = "保存"
 local CMD_LOAD   = "加载"
 local CMD_REMOVE = "删除"
 local CMD_LIST   = "列表"
+local CMD_DEBUG  = "debug"
 
 -- 判断表中是否有元素（用于空配置检测）
 local function hasElements(T)
@@ -50,6 +76,98 @@ local function ABP_Msg(msg)
     end
 end
 
+-- 诊断输出：级别 1 起生效（/abprofile debug 打开）
+local function ABP_Dbg(msg)
+    if ABP_DebugLevel >= 1 and DEFAULT_CHAT_FRAME and msg then
+        DEFAULT_CHAT_FRAME:AddMessage("|cff33aaff[ABP调试]|r " .. msg)
+    end
+end
+
+-- 逐条事件输出：只有级别 2 才打（/abprofile debug all），平时用汇总行代替
+local function ABP_Dbg2(msg)
+    if ABP_DebugLevel >= 2 and DEFAULT_CHAT_FRAME and msg then
+        DEFAULT_CHAT_FRAME:AddMessage("|cff33aaff[ABP调试]|r " .. msg)
+    end
+end
+
+-- 输出一个防抖窗口内的事件统计并清零：一条汇总行代替成百上千条逐事件日志
+local function ABP_DbgFlushEventStats()
+    if ABP_DebugLevel < 1 then return end
+    if ABP_StatAccepted == 0 and ABP_StatIgnoredSelf == 0
+       and ABP_StatIgnoredStartup == 0 and ABP_StatIgnoredNoise == 0 then
+        return
+    end
+
+    local text = "事件窗口：接受 " .. ABP_StatAccepted .. " 个"
+    if ABP_StatFirstAccepted then
+        text = text .. "（首个 " .. ABP_StatFirstAccepted .. "）"
+    end
+    text = text .. "，忽略噪音 " .. ABP_StatIgnoredNoise
+        .. " 个、自触发 " .. ABP_StatIgnoredSelf
+        .. " 个、登录窗口 " .. ABP_StatIgnoredStartup .. " 个"
+    ABP_Dbg(text)
+
+    ABP_StatAccepted = 0
+    ABP_StatIgnoredSelf = 0
+    ABP_StatIgnoredStartup = 0
+    ABP_StatIgnoredNoise = 0
+    ABP_StatFirstAccepted = nil
+end
+
+-- 时间戳文本：避免依赖 string.format 的浮点格式（1.12 的 Lua 版本较老）
+local function ABP_TimeText(t)
+    return tostring(math.floor(t * 10) / 10) .. "s"
+end
+
+-- 登记一次"真的改了动作条"的变化：计入统计并进入 5 秒防抖
+local function ABP_NoteChange(what)
+    ABP_StatAccepted = ABP_StatAccepted + 1
+    if not ABP_StatFirstAccepted then
+        ABP_StatFirstAccepted = what .. " @" .. ABP_TimeText(GetTime())
+    end
+    ABP_Dbg2("接受 " .. what)
+    ABP_PendingSave = true
+    ABP_LastChangeTime = GetTime()
+end
+
+-- 重建全部槽位的廉价指纹（不做 Tooltip、不碰光标，开销极小）
+local function ABP_RebuildCheapCache()
+    for i = 1, MAX_ACTIONS do
+        if HasAction(i) then
+            ABP_SlotTexture[i] = GetActionTexture(i)
+            ABP_SlotMacro[i] = GetActionText(i)
+        else
+            ABP_SlotTexture[i] = nil
+            ABP_SlotMacro[i] = nil
+        end
+    end
+    ABP_CacheDirty = false
+end
+
+-- ===== 触发源：只认"真的往动作槽里放了东西" =====
+-- 1) 挂钩 PlaceAction：拖技能/物品/宏到按钮、以及别的插件改写动作条都会走这里；
+--    客户端因拾取/采药/开箱等背包变动补发的动作条事件完全不经过它。
+-- 2) ACTIONBAR_SLOT_CHANGED：只在该槽位的廉价指纹（宏名 / 图标）真的变了时才认。
+-- 其余事件一律在 O(1) 里丢掉，不会触发任何扫描。
+local ABP_OrigPlaceAction = PlaceAction
+PlaceAction = function(slot)
+    ABP_OrigPlaceAction(slot)
+
+    if ABP_SavingInProgress or not ABP_PlayerName then return end
+    if GetTime() < ABP_SelfChangeUntil then return end
+    if GetTime() - ABP_StartupTime < ABP_StartupDelay then return end
+
+    ABP_NoteChange("PlaceAction 槽位" .. tostring(slot) .. " @" .. ABP_TimeText(GetTime()))
+end
+
+-- 光标上是否正拿着东西（玩家在拖拽/放置技能、物品或宏）
+local function ABP_CursorBusy()
+    if CursorHasItem and CursorHasItem() then return true end
+    if CursorHasSpell and CursorHasSpell() then return true end
+    if CursorHasMacro and CursorHasMacro() then return true end
+    return false
+end
+
 -- 将工具 Tooltip 绑定到 UIParent（供保存/加载时探测动作与物品名称）
 local function ABP_TooltipAttach()
     if ABP_Tooltip and ABP_Tooltip.SetOwner then
@@ -57,64 +175,221 @@ local function ABP_TooltipAttach()
     end
 end
 
--- 保存当前动作条到指定配置
--- 逐个扫描动作槽：宏 -> 技能 -> 物品，分别存入对应子表；silent 为 true 时不输出提示
-function ABP_SaveProfile(profileName, silent)
-    if not profileName or profileName == "" then return end
-    if not ABP_PlayerName then return end
-    if not ABP_Layout then ABP_Layout = {} end
-    if not ABP_Layout[ABP_PlayerName] then ABP_Layout[ABP_PlayerName] = {} end
+-- ===== 保存任务 =====
+-- 一帧之内对几十个槽位做 SetAction（生成 Tooltip）+ PickupAction/PlaceAction 会造成明显卡顿，
+-- 所以保存拆到多帧执行；而且只有真的发生变化的动作条才会走到这里（见上面的触发源）。
+local ABP_Job = nil            -- 进行中的保存任务
+local ABP_JobSlotsPerFrame = 6 -- 每帧处理的槽位数（越小越不卡，总耗时越长）
 
-    ABP_Layout[ABP_PlayerName][profileName] = {
-        spells = {},  -- [slot] = { name=, rank= }
-        macros = {},  -- [slot] = macroName
-        items  = {},  -- [slot] = itemName
-    }
+-- 中断进行中的保存任务（加载配置前、或新的保存请求到来时）
+local function ABP_JobAbort()
+    if not ABP_Job then return end
+    SetCVar("autoSelfCast", ABP_Job.scStatus)
+    ABP_Job = nil
+    ABP_SavingInProgress = false
+    ABP_SelfChangeUntil = GetTime() + ABP_SelfChangeGrace
+end
 
-    ABP_TooltipAttach()
+-- 完整扫描单个槽位：宏 -> 技能 -> 物品（技能/物品靠 PickupAction + CursorHasSpell 判定）
+-- 顺带刷新该槽位的廉价指纹，供事件过滤使用
+local function ABP_ScanSlot(dest, i)
+    if not HasAction(i) then
+        ABP_SlotTexture[i] = nil
+        ABP_SlotMacro[i] = nil
+        return
+    end
 
-    local scStatus = GetCVar("autoSelfCast")
-    SetCVar("autoSelfCast", 0)
+    ABP_SlotTexture[i] = GetActionTexture(i)
+    ABP_SlotMacro[i] = GetActionText(i)
 
-    ABP_SavingInProgress = true
-    for i = 1, MAX_ACTIONS do
-        if HasAction(i) then
-            local macroName = GetActionText(i)
-            if macroName and macroName ~= "" then
-                ABP_Layout[ABP_PlayerName][profileName].macros[i] = macroName
-            else
-                ABP_Tooltip:ClearLines()
-                ABP_Tooltip:SetAction(i)
+    local macroName = GetActionText(i)
+    if macroName and macroName ~= "" then
+        dest.macros[i] = macroName
+        return
+    end
 
-                local isSpell = false
-                do
-                    PickupAction(i)
-                    isSpell = CursorHasSpell()
-                    PlaceAction(i)
+    ABP_Tooltip:ClearLines()
+    ABP_Tooltip:SetAction(i)
+
+    local isSpell = false
+    PickupAction(i)
+    isSpell = CursorHasSpell()
+    PlaceAction(i)
+
+    if isSpell then
+        local spellName, rankText = ABP_GetTooltipLine1()
+        if spellName and spellName ~= "" then
+            dest.spells[i] = {
+                name = spellName,
+                rank = rankText,
+            }
+        end
+    else
+        local itemName = (select(1, ABP_GetTooltipLine1()))
+        if itemName and itemName ~= "" then
+            dest.items[i] = itemName
+        end
+    end
+end
+
+-- 比较两份配置内容是否完全一致（自动保存时用来跳过无意义的重复写入）
+local function ABP_IsSameProfile(a, b)
+    if not a or not b then return false end
+    for _, group in ipairs({ "spells", "macros", "items" }) do
+        local ta, tb = a[group], b[group]
+        if ta and tb then
+            for k, v in pairs(ta) do
+                local w = tb[k]
+                if type(v) == "table" then
+                    if type(w) ~= "table" or w.name ~= v.name or w.rank ~= v.rank then
+                        return false
+                    end
+                elseif w ~= v then
+                    return false
                 end
+            end
+            for k in pairs(tb) do
+                if ta[k] == nil then return false end
+            end
+        elseif ta ~= tb then
+            return false
+        end
+    end
+    return true
+end
 
-                if isSpell then
-                    local spellName, rankText = ABP_GetTooltipLine1()
-                    if spellName and spellName ~= "" then
-                        ABP_Layout[ABP_PlayerName][profileName].spells[i] = {
-                            name = spellName,
-                            rank = rankText,
-                        }
-                    end
-                else
-                    local itemName = (select(1, ABP_GetTooltipLine1()))
-                    if itemName and itemName ~= "" then
-                        ABP_Layout[ABP_PlayerName][profileName].items[i] = itemName
-                    end
+-- 汇总两份配置的槽位差异，仅用于调试输出（最多列 8 条）
+local function ABP_DiffSummary(old, new)
+    local parts = {}
+    local function describe(v)
+        if type(v) == "table" then
+            local text = tostring(v.name or "?")
+            if v.rank and v.rank ~= "" then text = text .. " " .. v.rank end
+            return text
+        end
+        if v == nil then return "空" end
+        return tostring(v)
+    end
+
+    for _, group in ipairs({ "spells", "macros", "items" }) do
+        local ta = (old and old[group]) or {}
+        local tb = (new and new[group]) or {}
+        local slots = {}
+        for k in pairs(ta) do slots[k] = true end
+        for k in pairs(tb) do slots[k] = true end
+
+        local keys = {}
+        for k in pairs(slots) do table.insert(keys, k) end
+        table.sort(keys)
+
+        for _, k in ipairs(keys) do
+            local a, b = ta[k], tb[k]
+            local changed
+            if type(a) == "table" or type(b) == "table" then
+                changed = type(a) ~= type(b) or type(a) == "table" and (a.name ~= b.name or a.rank ~= b.rank)
+            else
+                changed = a ~= b
+            end
+            if changed then
+                table.insert(parts, group .. " 槽" .. k .. " " .. describe(a) .. " → " .. describe(b))
+                if table.getn(parts) >= 8 then
+                    return table.concat(parts, "；") .. " …"
                 end
             end
         end
     end
-    ABP_SavingInProgress = false
 
-    SetCVar("autoSelfCast", scStatus)
-    if not silent then
-        ABP_Msg('配置文件 "' .. profileName .. '" 已保存.')
+    if table.getn(parts) == 0 then return "无" end
+    return table.concat(parts, "；")
+end
+
+-- 保存当前动作条到指定配置（异步：真正的扫描与写入由 ABP_RunSaveJob 分帧完成）
+-- silent 为 true 时不输出提示；skipIfUnchanged 为 true 时内容没变就不写入、不提示
+-- 返回是否已开始执行
+function ABP_SaveProfile(profileName, silent, skipIfUnchanged)
+    if not profileName or profileName == "" then return false end
+    if not ABP_PlayerName then return false end
+    if not ABP_Layout then ABP_Layout = {} end
+    if not ABP_Layout[ABP_PlayerName] then ABP_Layout[ABP_PlayerName] = {} end
+
+    if ABP_Job then ABP_JobAbort() end
+
+    ABP_TooltipAttach()
+
+    ABP_Job = {
+        name = profileName,
+        silent = silent,
+        skipIfUnchanged = skipIfUnchanged,
+        phase = "scan",  -- scan=分帧完整扫描 done=比对写入
+        i = 0,           -- 已处理到的槽位
+        dest = {
+            spells = {},  -- [slot] = { name=, rank= }
+            macros = {},  -- [slot] = macroName
+            items  = {},  -- [slot] = itemName
+        },
+        previous = ABP_Layout[ABP_PlayerName][profileName],
+        scStatus = GetCVar("autoSelfCast"),
+    }
+
+    -- autoSelfCast 只在任务期间关闭一次，避免每帧改 CVar 引起动作按钮整体刷新
+    SetCVar("autoSelfCast", 0)
+
+    ABP_SavingInProgress = true
+    ABP_Dbg('开始扫描动作条（"' .. profileName .. '"）')
+    return true
+end
+
+-- 分帧执行保存任务：每帧最多处理 ABP_JobSlotsPerFrame 个槽位
+function ABP_RunSaveJob()
+    local job = ABP_Job
+    if not job then return end
+
+    local last = job.i + ABP_JobSlotsPerFrame
+    if last > MAX_ACTIONS then last = MAX_ACTIONS end
+
+    -- 第一段：分帧完整扫描（宏/技能/物品）
+    if job.phase == "scan" then
+        -- 玩家正在拖拽：本帧不动光标，等下一帧再继续（并记下，收尾时补一次比对）
+        if ABP_CursorBusy() then
+            job.pausedForCursor = true
+            ABP_Dbg("光标上有物品/技能，暂停扫描")
+            return
+        end
+
+        for i = job.i + 1, last do
+            ABP_ScanSlot(job.dest, i)
+        end
+        job.i = last
+
+        if job.i >= MAX_ACTIONS then
+            SetCVar("autoSelfCast", job.scStatus) -- 扫描结束，还原 CVar
+            ABP_CacheDirty = false
+            job.phase = "done"
+        end
+        return
+    end
+
+    -- 收尾：比对结果，决定是否写入
+    ABP_SelfChangeUntil = GetTime() + ABP_SelfChangeGrace
+    ABP_SavingInProgress = false
+    ABP_Job = nil
+
+    -- 扫描期间因为玩家拖拽暂停过：再排一次比对，避免漏掉拖拽带来的变化
+    if job.pausedForCursor then
+        ABP_PendingSave = true
+        ABP_LastChangeTime = GetTime()
+    end
+
+    if job.skipIfUnchanged and ABP_IsSameProfile(job.previous, job.dest) then
+        ABP_Dbg('比对结果（"' .. job.name .. '"）：内容与已存配置一致，本次不写入')
+        return
+    end
+
+    ABP_Dbg('写入 "' .. job.name .. '"：' .. ABP_DiffSummary(job.previous, job.dest))
+
+    ABP_Layout[ABP_PlayerName][job.name] = job.dest
+    if not job.silent then
+        ABP_Msg('配置文件 "' .. job.name .. '" 已保存.')
     end
 end
 
@@ -220,6 +495,9 @@ function ABP_LoadProfile(profileName)
         return
     end
 
+    -- 有保存任务在跑就先中断，避免两个流程同时操作动作条
+    ABP_JobAbort()
+
     local profile = ABP_Layout[ABP_PlayerName][profileName]
     local spells = profile.spells or {}
     local macros = profile.macros or {}
@@ -312,9 +590,13 @@ function ABP_LoadProfile(profileName)
             ClearCursor()
         until true
     end
+    ABP_SelfChangeUntil = GetTime() + ABP_SelfChangeGrace
+    SetCVar("autoSelfCast", scStatus)
     ABP_SavingInProgress = false
 
-    SetCVar("autoSelfCast", scStatus)
+    -- 动作条已被程序改写：廉价指纹作废，等下次重建后再用来过滤事件
+    ABP_CacheDirty = true
+
     ABP_Msg('配置文件 "' .. profileName .. '" 已加载.')
 end
 
@@ -353,35 +635,78 @@ function ABP_GetAutoProfileName()
 end
 
 -- 执行自动保存（保存到 "职业+角色名" 配置）
+-- 实际扫描分帧进行，内容一致时不会写入、也不会提示
 function ABP_AutoSaveProfile()
     local profileName = ABP_GetAutoProfileName()
     if not profileName then return nil end
-    ABP_SaveProfile(profileName)
+    ABP_DbgFlushEventStats()
+    ABP_SaveProfile(profileName, false, true)
     return profileName
 end
 
 -- 事件驱动：动作条内容变化后，等待 5 秒无再次变化才自动保存（防抖，避免频繁保存）
-local ABP_PendingSave = false
-local ABP_LastChangeTime = 0
-local ABP_DebounceInterval = 5 -- 防抖间隔（秒）
-local ABP_StartupDelay = 30 -- 登录/重载后的静默窗口期（秒），避免客户端初始化动作条时误触发保存
-local ABP_StartupTime = 0
+function ABP_OnActionBarChanged(evtName, slot)
+    local now = GetTime()
+    local evtText = tostring(evtName or "?") .. " 槽位" .. tostring(slot or "-") .. " @" .. ABP_TimeText(now)
 
-function ABP_OnActionBarChanged()
     -- 静默窗口期内忽略动作条变化，防止登录时客户端恢复动作条覆盖已有配置
-    if GetTime() - ABP_StartupTime < ABP_StartupDelay then return end
-    if not ABP_PlayerName or ABP_SavingInProgress then return end
-    ABP_PendingSave = true
-    ABP_LastChangeTime = GetTime()
+    if now - ABP_StartupTime < ABP_StartupDelay then
+        ABP_StatIgnoredStartup = ABP_StatIgnoredStartup + 1
+        ABP_Dbg2("忽略 " .. evtText .. "（登录静默窗口内）")
+        return
+    end
+    -- 自身改动（保存/加载）产生的延迟事件不算玩家操作
+    if not ABP_PlayerName or ABP_SavingInProgress or now < ABP_SelfChangeUntil then
+        ABP_StatIgnoredSelf = ABP_StatIgnoredSelf + 1
+        ABP_Dbg2("忽略 " .. evtText .. "（自触发窗口内）")
+        return
+    end
+
+    -- 廉价过滤（不碰 Tooltip、不碰光标、不改 CVar）：
+    -- 只有该槽位的宏名 / 图标真的变了，才认为这条事件需要保存。
+    -- 客户端在拾取、采药、开箱等背包变动后补发的 ACTIONBAR_SLOT_CHANGED 内容并没有变，
+    -- 到这里就被丢掉，绝不会走到扫描与卡顿。
+    local slotNum = tonumber(slot)
+    if not slotNum or slotNum < 1 or slotNum > MAX_ACTIONS then
+        ABP_StatIgnoredNoise = ABP_StatIgnoredNoise + 1
+        ABP_Dbg2("忽略 " .. evtText .. "（无有效槽位，按噪音丢弃）")
+        return
+    end
+
+    if ABP_CacheDirty then ABP_RebuildCheapCache() end
+
+    local macroText = GetActionText(slotNum)
+    local texture = GetActionTexture(slotNum)
+    if (macroText or "") == (ABP_SlotMacro[slotNum] or "") and texture == ABP_SlotTexture[slotNum] then
+        ABP_StatIgnoredNoise = ABP_StatIgnoredNoise + 1
+        ABP_Dbg2("忽略 " .. evtText .. "（该槽位内容未变）")
+        return
+    end
+
+    -- 内容确实变了：刷新指纹并登记变化
+    ABP_SlotMacro[slotNum] = macroText
+    ABP_SlotTexture[slotNum] = texture
+    ABP_NoteChange(evtText)
 end
 
--- 由独立计时帧每帧驱动：变化后安静满 5 秒才保存一次
+-- 由独立计时帧每帧驱动：先推进进行中的保存任务，再处理防抖到期的自动保存
 function ABP_OnUpdate(frame, elapsed)
-    if not ABP_PlayerName or not ABP_PendingSave then return end
-    if GetTime() - ABP_LastChangeTime >= ABP_DebounceInterval then
-        ABP_PendingSave = false
-        ABP_AutoSaveProfile()
+    -- 保存任务分帧执行，未完成前不启动新的
+    if ABP_Job then
+        ABP_RunSaveJob()
+        return
     end
+
+    if not ABP_PlayerName or not ABP_PendingSave then return end
+    if GetTime() - ABP_LastChangeTime < ABP_DebounceInterval then return end
+    -- 玩家手上还拿着东西（拖拽中）：推迟保存，避免扫描时的拾取/放置打断操作
+    if ABP_CursorBusy() then
+        ABP_Dbg("光标上有物品/技能，推迟本次自动保存")
+        ABP_LastChangeTime = GetTime()
+        return
+    end
+    ABP_PendingSave = false
+    ABP_AutoSaveProfile()
 end
 
 -- 创建独立的自动保存计时帧
@@ -395,6 +720,7 @@ end
 -- 插件加载：注册事件与斜杠命令
 function ABP_OnLoad()
     this:RegisterEvent("VARIABLES_LOADED")
+    this:RegisterEvent("PLAYER_ENTERING_WORLD")
     this:RegisterEvent("ACTIONBAR_SLOT_CHANGED")
     this:RegisterEvent("UPDATE_BONUS_ACTIONBAR")
     this:RegisterEvent("UPDATE_MULTI_CAST_ACTIONBAR")
@@ -416,8 +742,21 @@ function ABP_OnEvent()
         UIDropDownMenu_Initialize(getglobal("ABP_DropDownMenu"), ABP_DropDownMenu_OnLoad, "MENU")
         ABPButton_UpdatePosition()
         ABP_CreateTimerFrame()
-    elseif event == "ACTIONBAR_SLOT_CHANGED" or event == "UPDATE_BONUS_ACTIONBAR" or event == "UPDATE_MULTI_CAST_ACTIONBAR" then
-        ABP_OnActionBarChanged()
+    elseif event == "PLAYER_ENTERING_WORLD" then
+        -- 加载画面结束后才是客户端恢复/回填动作条的高峰期，静默窗口从这里重新计时
+        -- （只在登录/重载后的第一次进入世界重置，之后切换地图不会重置）
+        if ABP_FirstWorldEnter then
+            ABP_FirstWorldEnter = false
+            ABP_StartupTime = GetTime()
+            ABP_CacheDirty = true -- 客户端刚回填完动作条，廉价指纹要重建
+            ABP_Dbg("进入世界，登录静默窗口重新计时（" .. ABP_StartupDelay .. " 秒）")
+        end
+    elseif event == "ACTIONBAR_SLOT_CHANGED" then
+        ABP_OnActionBarChanged(event, arg1)
+    elseif event == "UPDATE_BONUS_ACTIONBAR" or event == "UPDATE_MULTI_CAST_ACTIONBAR" then
+        -- 换形态 / 翻页：槽位整体换了一套内容，只作废廉价指纹，不触发保存
+        ABP_CacheDirty = true
+        ABP_Dbg2("忽略 " .. tostring(event) .. "（换页/换形态，仅重建廉价指纹）")
     end
 end
 
@@ -430,6 +769,31 @@ function ABP_SlashCommand(msg)
         ABP_Msg("/abprofile 加载 [配置文件名字]")
         ABP_Msg("/abprofile 删除 [配置文件名字]")
         ABP_Msg("/abprofile 列表")
+        ABP_Msg("/abprofile debug")
+        ABP_Msg("/abprofile debug all (连每条动作条事件都打印)")
+        return
+    end
+
+    -- 诊断开关：/abprofile debug（摘要），/abprofile debug all（每条事件都打印）
+    -- 要求出现在命令开头，避免配置文件名字里含 debug 时误判
+    local lowerMsg = string.lower(msg)
+    if string.find(lowerMsg, "^%s*" .. CMD_DEBUG) then
+        if string.find(lowerMsg, "all", 1, true) then
+            ABP_DebugLevel = 2
+        else
+            ABP_DebugLevel = (ABP_DebugLevel == 0) and 1 or 0
+        end
+
+        if ABP_DebugLevel == 0 then
+            ABP_Msg("ActionBarProfiles 诊断输出已关闭.")
+        elseif ABP_DebugLevel == 1 then
+            ABP_Msg("ActionBarProfiles 诊断输出已打开（按防抖窗口汇总，不刷屏）.")
+            ABP_Msg("会打印：事件汇总、指纹/内容比对结果、写入的槽位差异.")
+            ABP_Msg("想连每个事件都看，用 /abprofile debug all")
+        else
+            ABP_Msg("ActionBarProfiles 诊断输出已打开：all，每条动作条事件都会打印（可能刷屏）.")
+            ABP_Msg("回到汇总模式：/abprofile debug")
+        end
         return
     end
 
