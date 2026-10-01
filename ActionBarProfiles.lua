@@ -721,8 +721,8 @@ function ABP_CreateTimerFrame()
 end
 
 -- ===== 插件开关 =====
--- off：不再监听动作条事件、不再自动保存；小地图按钮与菜单功能完全不变（随时可以点开重新开启）。
---      状态保存在 SavedVariables 里（ABP_Enabled）。
+-- off（默认）：不再监听动作条事件、不再自动保存；小地图按钮与菜单功能完全不变。
+-- on：恢复监听与自动保存。状态保存在 SavedVariables 里（ABP_Enabled）。
 function ABP_SetEnabled(enabled, silent)
     ABP_Enabled = enabled and true or false
 
@@ -779,15 +779,16 @@ function ABP_OnEvent()
 
         if ABP_ButtonPosition == nil then ABP_ButtonPosition = 60 end
 
-        -- 开关状态：SavedVariables 里没有就默认开启
-        if ABP_Enabled == nil then ABP_Enabled = true end
+        -- 开关状态：SavedVariables 里没有就默认关闭（首次使用需 /abprofile on 开启）
+        if ABP_Enabled == nil then ABP_Enabled = false end
 
         UIDropDownMenu_Initialize(getglobal("ABP_DropDownMenu"), ABP_DropDownMenu_OnLoad, "MENU")
         ABPButton_UpdatePosition()
         ABP_CreateTimerFrame()
         ABP_SetEnabled(ABP_Enabled, true)
         if not ABP_Enabled then
-            ABP_Msg("ActionBarProfiles 处于关闭状态（不监听动作条、不自动保存）. 开启：/abprofile on")
+            ABP_Msg("ActionBarProfiles 当前是关闭状态（不监听动作条、不自动保存）. 开启：/abprofile on")
+            ABP_Msg("查看全部命令：/abprofile")
         end
     elseif event == "PLAYER_ENTERING_WORLD" then
         -- 加载画面结束后才是客户端恢复/回填动作条的高峰期，静默窗口从这里重新计时
@@ -814,7 +815,7 @@ function ABP_PrintHelp()
     ABP_Msg("  /abprofile 加载 <名字>    加载配置，完全覆盖当前动作条")
     ABP_Msg("  /abprofile 删除 <名字>    删除配置")
     ABP_Msg("  /abprofile 列表           列出本角色的所有配置")
-    ABP_Msg("  /abprofile on | off       开启/关闭插件（当前：" .. (ABP_Enabled == false and "关闭" or "开启") .. "）")
+    ABP_Msg("  /abprofile on | off       开启/关闭插件（当前：" .. (ABP_Enabled and "开启" or "关闭") .. "）")
     ABP_Msg("  /abprofile debug          诊断输出：关 / 按防抖窗口汇总（当前：" .. ABP_DebugLevel .. " 级）")
     ABP_Msg("  /abprofile debug all      诊断输出：每条动作条事件都打印")
     ABP_Msg("不带参数的 /abprofile 就是这份提示.")
