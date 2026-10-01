@@ -166,7 +166,11 @@ ABP_Enabled = <true|false>      -- 插件开关（/abprofile on|off），默认 
   2. `比对结果（"配置名"）：…` 或 `写入 "配置名"：<槽位差异>`
 
   `ACTIONBAR_SLOT_CHANGED` 是按槽位逐个发的、保存一次扫描就能产生几十个，所以被忽略的事件只计数不打印；确实需要逐条看时用 `/abprofile debug all`（级别 2）。
-- 注销（`PLAYER_LOGOUT`）阶段动作条已被客户端清空，因此**不执行自动保存**，避免覆盖有效数据。
+- **退出 / 登出 / 重载前补救保存**（`PLAYER_LOGOUT`）：分帧任务来不及跑完，所以这里由 `ABP_SaveOnLogout` **同步**扫一遍再写；客户端正是在这个事件处理完之后才写 SavedVariables，因此来得及。此时动作条 API 不一定还可用，所以有两道保护，宁可不动也不写坏：
+  1. 存档里本来有内容，这次却读不出动作（或读出来是空的）→ 判定动作条已不可读，**放弃**；
+  2. 原来存着技能、这次一个技能都没识别出来 → 判定拾取探测已失效，**放弃**。
+
+  另外这一步会顺手作废进行中的分帧任务并还原 `autoSelfCast`，避免把临时关闭的状态留在配置里。`/reload` 时 UI 完全存活，这一步最可靠；插件处于关闭状态时不做这一步。
 
 ## 函数清单
 
@@ -189,6 +193,7 @@ ABP_Enabled = <true|false>      -- 插件开关（/abprofile on|off），默认 
 | `ABPButton_BeingDragged` | 拖动中计算角度 |
 | `ABPButton_SetPosition` | 设置并持久化角度 |
 | `ABP_AutoSaveProfile` | 执行自动保存（内容无变化时跳过，返回配置名或 nil） |
+| `ABP_SaveOnLogout` | 退出/登出/重载前的同步补救保存（带不可读保护） |
 | `ABP_OnActionBarChanged` | 动作条变化事件处理（防抖标记，带调试输出） |
 | `ABP_OnUpdate` | 计时帧驱动，防抖到期执行保存 |
 | `ABP_CreateTimerFrame` | 创建独立计时帧 |
@@ -198,6 +203,7 @@ ABP_Enabled = <true|false>      -- 插件开关（/abprofile on|off），默认 
 | 函数 | 作用 |
 |------|------|
 | `hasElements` | 判断表是否为空 |
+| `ABP_CountKeys` | 统计表中键的数量（配置里存了多少个动作槽） |
 | `ABP_IsSameProfile` | 比较两份配置内容是否完全一致（自动保存跳过无变化写入） |
 | `ABP_NoteChange` | 登记一次"真的改了动作条"的变化并进入防抖 |
 | `ABP_RebuildCheapCache` | 重建全部槽位的廉价指纹（宏名 / 图标） |
@@ -238,4 +244,4 @@ ABP_Enabled = <true|false>      -- 插件开关（/abprofile on|off），默认 
 3. **宏兼容双路径**：`GetSuperMacroInfo`（超级宏）与 `GetMacroIndexByName`（普通宏）双路回退。
 4. **性能优化**：加载前预构建技能/物品映射表，将多次重复的 Tooltip 探测压缩为一次性的线性扫描（法术书、19 装备位、背包），并带 `leftCount` 提前终止；**保存则分帧执行**（每帧 `ABP_JobSlotsPerFrame` 个槽位），避免单帧集中做几十次 Tooltip + 拾取/放置造成掉帧。
 5. **自触发抑制**：`ABP_SavingInProgress` 覆盖任务执行期间（自己扫描时的 `PlaceAction` 因此不会被挂钩认作玩家操作），`ABP_SelfChangeUntil`（1 秒）覆盖客户端延迟派发的尾随事件，廉价指纹则让"内容没变"的事件连扫描都进不去。
-6. **注销阶段不保存**：`PLAYER_LOGOUT` 时动作条已被客户端清空，直接保存会写入空数据，故自动保存仅在正常游戏帧中通过事件/计时触发。
+6. **退出前同步补救保存**：`PLAYER_LOGOUT` 之后没有帧可驱动分帧任务，所以改由 `ABP_SaveOnLogout` 同步扫描；并带"读不到动作条 / 技能全部识别失败就放弃"的保护，绝不用空数据覆盖已有配置（旧版直接不保存，会丢掉最后几秒的改动）。

@@ -48,6 +48,15 @@ local function hasElements(T)
     return 0
 end
 
+-- 统计表的键数量（配置里实际存了多少个动作槽）
+local function ABP_CountKeys(T)
+    local n = 0
+    if type(T) == "table" then
+        for _ in pairs(T) do n = n + 1 end
+    end
+    return n
+end
+
 -- 安全读取工具 Tooltip 第一行文本，返回 (左文本, 右文本)
 local function ABP_GetTooltipLine1()
     local left, right = nil, nil
@@ -644,6 +653,62 @@ function ABP_AutoSaveProfile()
     return profileName
 end
 
+-- 退出 / 登出 / 重载前的补救保存：必须一次同步做完（此后没有帧能驱动分帧任务）。
+-- 客户端是在 PLAYER_LOGOUT 处理完之后才写 SavedVariables 的，所以来得及；
+-- 但此阶段动作条 API 不一定还可用：读不出来就放弃，绝不用空数据或坏数据覆盖已有配置。
+function ABP_SaveOnLogout()
+    if not ABP_Enabled or not ABP_PlayerName then return end
+    if not ABP_Layout or not ABP_Layout[ABP_PlayerName] then return end
+
+    local profileName = ABP_GetAutoProfileName()
+    if not profileName then return end
+
+    -- 进行中的分帧任务来不及跑完：作废（顺带把 autoSelfCast 还原，避免把关闭状态写进配置）
+    ABP_JobAbort()
+
+    local dest = { spells = {}, macros = {}, items = {} }
+    local readCount = 0
+    ABP_SavingInProgress = true -- 让 PlaceAction 挂钩忽略这次扫描（别当成玩家操作）
+    for i = 1, MAX_ACTIONS do
+        if HasAction(i) then
+            readCount = readCount + 1
+            ABP_ScanSlot(dest, i)
+        end
+    end
+    ABP_SavingInProgress = false
+
+    local previous = ABP_Layout[ABP_PlayerName][profileName]
+    local prevMacros  = previous and previous.macros or {}
+    local prevItems   = previous and previous.items  or {}
+    local prevSpells  = previous and previous.spells or {}
+    local prevCount = ABP_CountKeys(prevSpells) + ABP_CountKeys(prevMacros) + ABP_CountKeys(prevItems)
+    local newCount  = ABP_CountKeys(dest.spells) + ABP_CountKeys(dest.macros) + ABP_CountKeys(dest.items)
+
+    -- 保护一：存档里本来有内容，这次却什么都读不出来（或读出来是空的）→ 动作条已不可读，保留原数据
+    if prevCount > 0 and (readCount == 0 or newCount == 0) then
+        ABP_Dbg("退出保存：此刻读不到动作条内容，放弃（保留已有配置）")
+        return
+    end
+
+    -- 保护二：原来存着技能，这次一个技能都没识别出来 → 多半是退出阶段 PickupAction/CursorHasSpell 已失效
+    if ABP_CountKeys(prevSpells) > 0 and ABP_CountKeys(dest.spells) == 0 then
+        ABP_Dbg("退出保存：技能识别异常（退出阶段拾取探测可能已失效），放弃")
+        return
+    end
+
+    ABP_PendingSave = false
+    ABP_CacheDirty = false
+
+    if ABP_IsSameProfile(previous, dest) then
+        ABP_Dbg("退出保存：内容与已存配置一致，无需写入")
+        return
+    end
+
+    ABP_Layout[ABP_PlayerName][profileName] = dest
+    ABP_Dbg('退出前已保存 "' .. profileName .. '"（读到 ' .. readCount .. ' 个动作槽）：'
+        .. ABP_DiffSummary(previous, dest))
+end
+
 -- 事件驱动：动作条内容变化后，等待 5 秒无再次变化才自动保存（防抖，避免频繁保存）
 function ABP_OnActionBarChanged(evtName, slot)
     local now = GetTime()
@@ -736,11 +801,13 @@ function ABP_SetEnabled(enabled, silent)
     if frame then
         if ABP_Enabled then
             frame:RegisterEvent("PLAYER_ENTERING_WORLD")
+            frame:RegisterEvent("PLAYER_LOGOUT")
             frame:RegisterEvent("ACTIONBAR_SLOT_CHANGED")
             frame:RegisterEvent("UPDATE_BONUS_ACTIONBAR")
             frame:RegisterEvent("UPDATE_MULTI_CAST_ACTIONBAR")
         else
             frame:UnregisterEvent("PLAYER_ENTERING_WORLD")
+            frame:UnregisterEvent("PLAYER_LOGOUT")
             frame:UnregisterEvent("ACTIONBAR_SLOT_CHANGED")
             frame:UnregisterEvent("UPDATE_BONUS_ACTIONBAR")
             frame:UnregisterEvent("UPDATE_MULTI_CAST_ACTIONBAR")
@@ -761,6 +828,7 @@ end
 function ABP_OnLoad()
     this:RegisterEvent("VARIABLES_LOADED")
     this:RegisterEvent("PLAYER_ENTERING_WORLD")
+    this:RegisterEvent("PLAYER_LOGOUT")
     this:RegisterEvent("ACTIONBAR_SLOT_CHANGED")
     this:RegisterEvent("UPDATE_BONUS_ACTIONBAR")
     this:RegisterEvent("UPDATE_MULTI_CAST_ACTIONBAR")
@@ -799,6 +867,9 @@ function ABP_OnEvent()
             ABP_CacheDirty = true -- 客户端刚回填完动作条，廉价指纹要重建
             ABP_Dbg("进入世界，登录静默窗口重新计时（" .. ABP_StartupDelay .. " 秒）")
         end
+    elseif event == "PLAYER_LOGOUT" then
+        -- 退出 / 登出 / 重载：同步补救保存一次（分帧任务来不及跑完）
+        ABP_SaveOnLogout()
     elseif event == "ACTIONBAR_SLOT_CHANGED" then
         ABP_OnActionBarChanged(event, arg1)
     elseif event == "UPDATE_BONUS_ACTIONBAR" or event == "UPDATE_MULTI_CAST_ACTIONBAR" then
