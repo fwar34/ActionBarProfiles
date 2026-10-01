@@ -3,7 +3,7 @@
 ## Notes:保存和加载动作条配置
 ## Author: Ermean <Vanguard>, Emerald Dream 1.12.1, Feenix
 ## Version: 2.1
-## SavedVariables: ABP_Layout, ABP_ButtonPosition, ABP_Enabled
+## SavedVariables: ABP_Layout, ABP_ButtonPosition
 ActionBarProfiles.lua
 ActionBarProfiles.xml
 
