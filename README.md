@@ -9,6 +9,7 @@
 - **完全覆盖加载**：加载配置后动作条与保存时**完全一致**——保存时为空的动作槽位，加载后也会被清空，不会残留当前布局。
 - **自动保存**：只有**真的改动了动作条**（拖放技能/物品/宏，或其它插件改写动作条）才会触发；改动后等待 **5 秒无再次变化**才保存到以 **"职业+角色名"** 命名的配置（如"战士雾满拦江"）。触发前先过一遍 O(1) 的廉价过滤：**拾取尸体 / 采药 / 开箱**这类客户端补发的事件、登录静默窗口内的事件、以及保存/加载自身产生的尾随事件都会被直接丢掉，不扫描、不写盘、不刷聊天框、也不会造成卡顿。登录/重载后的 **30 秒静默窗口期**内不自动保存（起点为进入世界的那一刻）。若怀疑存在"没操作也自动保存"，用 `/abprofile debug` 看触发来源。
 - **手动保存/加载不会触发自动保存**：切换配置不会污染自动保存的数据。
+- **总开关**：`/abprofile off` 关闭插件（不再监听动作条事件、不再自动保存），`/abprofile on` 恢复；状态记在 `ABP_Enabled` 里，重登后保持。**关闭时小地图按钮与菜单功能完全不变**，手动 `保存|加载|删除|列表` 也照常可用，随时可以从按钮或命令重新开启。
 - **多角色隔离**：配置按"角色名 of 服务器名"隔离，互不干扰；同一角色可保存多套配置（如不同的专精/场景布局）。
 - **小地图按钮**：左键弹出菜单操作；右键拖动按钮绕小地图圆周定位，位置自动记忆。
 - **中文斜杠命令**：`/abprofile` 系列命令快速管理配置。
@@ -36,9 +37,13 @@
 /abprofile 加载 <配置名>     # 加载指定配置（完全覆盖当前动作条）
 /abprofile 删除 <配置名>     # 删除指定配置
 /abprofile 列表             # 列出当前角色的所有配置
+/abprofile on                # 开启插件（恢复监听动作条与自动保存）
+/abprofile off               # 关闭插件（不再监听动作条、不再自动保存；小地图按钮与菜单照旧）
 /abprofile debug             # 打开/关闭诊断输出（按防抖窗口汇总，不会刷屏）
 /abprofile debug all         # 诊断输出升级为逐条事件打印（排查用，可能刷屏）
 ```
+
+`/abprofile`（不带参数，或命令名后多打了空格）会打印上面这份命令提示，并显示当前的开关状态与诊断级别；`/abprofile help`、`/abprofile ?`、`/abprofile 帮助` 也可以，看不懂的命令同样会打印提示，而不是静默无反应。
 
 ### 自动保存
 
@@ -69,7 +74,7 @@ ActionBarProfiles/
 |------|-----|------|
 | Interface | 11200 | 1.12 接口版本 |
 | Title | [辅助]动作条保存 | 插件标题 |
-| SavedVariables | ABP_Layout, ABP_ButtonPosition | 持久化数据 |
+| SavedVariables | ABP_Layout, ABP_ButtonPosition, ABP_Enabled | 持久化数据（含插件开关状态） |
 | 加载顺序 | lua 在前，xml 在后 | 先定义逻辑，再构建界面 |
 
 另含平台相关的 `X-PluginId` / `X-PublishTime` 等扩展元数据（非暴雪标准字段）。
@@ -103,6 +108,7 @@ ABP_Layout = {
 }
 
 ABP_ButtonPosition = <number>   -- 小地图按钮角度（0~360）
+ABP_Enabled = <true|false>      -- 插件开关（/abprofile on|off），关闭时持久生效
 ```
 
 数据按 **角色 → 配置名 → 三种类型** 三层组织。键使用 `角色名 of 服务器名` 实现角色隔离。
@@ -168,13 +174,15 @@ ABP_ButtonPosition = <number>   -- 小地图按钮角度（0~360）
 | 函数 | 作用 |
 |------|------|
 | `ABP_OnLoad` | 注册事件与斜杠命令 |
-| `ABP_OnEvent` | 初始化角色名、保存变量、菜单、按钮位置 |
+| `ABP_OnEvent` | 初始化角色名、保存变量、菜单、按钮位置；应用插件开关状态 |
+| `ABP_SetEnabled` | 开启/关闭插件（注册/注销事件、显示/隐藏按钮、中断保存任务） |
 | `ABP_SaveProfile` | 保存配置（**异步**：只创建分帧任务；`silent` 静默、`skipIfUnchanged` 无变化时不写入） |
 | `ABP_RunSaveJob` | 分帧推进保存任务（由 `ABP_TimerFrame` 的 OnUpdate 每帧调用） |
 | `ABP_LoadProfile` | 加载配置 |
 | `ABP_ListProfiles` | 列出配置 |
 | `ABP_RemoveProfile` | 删除配置 |
-| `ABP_SlashCommand` | 斜杠命令分发 |
+| `ABP_SlashCommand` | 斜杠命令分发（无参数/无法识别时打印 `ABP_PrintHelp`） |
+| `ABP_PrintHelp` | 打印可用命令提示与当前开关/诊断状态 |
 | `ABP_DropDownMenu_OnLoad` | 构建下拉菜单 |
 | `ABPButton_UpdatePosition` | 按角度更新按钮位置 |
 | `ABPButton_BeingDragged` | 拖动中计算角度 |

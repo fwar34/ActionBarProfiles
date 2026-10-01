@@ -153,7 +153,7 @@ local ABP_OrigPlaceAction = PlaceAction
 PlaceAction = function(slot)
     ABP_OrigPlaceAction(slot)
 
-    if ABP_SavingInProgress or not ABP_PlayerName then return end
+    if not ABP_Enabled or ABP_SavingInProgress or not ABP_PlayerName then return end
     if GetTime() < ABP_SelfChangeUntil then return end
     if GetTime() - ABP_StartupTime < ABP_StartupDelay then return end
 
@@ -697,6 +697,9 @@ function ABP_OnUpdate(frame, elapsed)
         return
     end
 
+    -- 关闭状态下不做自动保存（但上面手动触发的保存任务仍会继续推进）
+    if not ABP_Enabled then return end
+
     if not ABP_PlayerName or not ABP_PendingSave then return end
     if GetTime() - ABP_LastChangeTime < ABP_DebounceInterval then return end
     -- 玩家手上还拿着东西（拖拽中）：推迟保存，避免扫描时的拾取/放置打断操作
@@ -715,6 +718,43 @@ function ABP_CreateTimerFrame()
     ABP_TimerFrame = CreateFrame("Frame", "ABP_TimerFrame", UIParent)
     ABP_TimerFrame:SetScript("OnUpdate", ABP_OnUpdate)
     ABP_TimerFrame:Show()
+end
+
+-- ===== 插件开关 =====
+-- off：不再监听动作条事件、不再自动保存；小地图按钮与菜单功能完全不变（随时可以点开重新开启）。
+--      状态保存在 SavedVariables 里（ABP_Enabled）。
+function ABP_SetEnabled(enabled, silent)
+    ABP_Enabled = enabled and true or false
+
+    -- 关闭时先收尾：中断进行中的保存任务、清掉待保存标记
+    if not ABP_Enabled then
+        ABP_JobAbort()
+        ABP_PendingSave = false
+    end
+
+    local frame = getglobal("ActionBarProfiles_IconFrame")
+    if frame then
+        if ABP_Enabled then
+            frame:RegisterEvent("PLAYER_ENTERING_WORLD")
+            frame:RegisterEvent("ACTIONBAR_SLOT_CHANGED")
+            frame:RegisterEvent("UPDATE_BONUS_ACTIONBAR")
+            frame:RegisterEvent("UPDATE_MULTI_CAST_ACTIONBAR")
+        else
+            frame:UnregisterEvent("PLAYER_ENTERING_WORLD")
+            frame:UnregisterEvent("ACTIONBAR_SLOT_CHANGED")
+            frame:UnregisterEvent("UPDATE_BONUS_ACTIONBAR")
+            frame:UnregisterEvent("UPDATE_MULTI_CAST_ACTIONBAR")
+        end
+    end
+
+    if not silent then
+        if ABP_Enabled then
+            ABP_Msg("ActionBarProfiles 已开启：动作条改动会在 5 秒后自动保存.")
+        else
+            ABP_Msg("ActionBarProfiles 已关闭：不再监听动作条、不再自动保存.")
+            ABP_Msg("小地图按钮与手动 保存|加载|删除|列表 仍然可用；重新开启：/abprofile on")
+        end
+    end
 end
 
 -- 插件加载：注册事件与斜杠命令
@@ -739,9 +779,16 @@ function ABP_OnEvent()
 
         if ABP_ButtonPosition == nil then ABP_ButtonPosition = 60 end
 
+        -- 开关状态：SavedVariables 里没有就默认开启
+        if ABP_Enabled == nil then ABP_Enabled = true end
+
         UIDropDownMenu_Initialize(getglobal("ABP_DropDownMenu"), ABP_DropDownMenu_OnLoad, "MENU")
         ABPButton_UpdatePosition()
         ABP_CreateTimerFrame()
+        ABP_SetEnabled(ABP_Enabled, true)
+        if not ABP_Enabled then
+            ABP_Msg("ActionBarProfiles 处于关闭状态（不监听动作条、不自动保存）. 开启：/abprofile on")
+        end
     elseif event == "PLAYER_ENTERING_WORLD" then
         -- 加载画面结束后才是客户端恢复/回填动作条的高峰期，静默窗口从这里重新计时
         -- （只在登录/重载后的第一次进入世界重置，之后切换地图不会重置）
@@ -760,25 +807,43 @@ function ABP_OnEvent()
     end
 end
 
+-- 命令提示：列出所有可用命令，并带上当前开关/诊断状态
+function ABP_PrintHelp()
+    ABP_Msg("ActionBarProfiles - 动作条配置保存/加载")
+    ABP_Msg("  /abprofile 保存 <名字>    把当前动作条存成配置")
+    ABP_Msg("  /abprofile 加载 <名字>    加载配置，完全覆盖当前动作条")
+    ABP_Msg("  /abprofile 删除 <名字>    删除配置")
+    ABP_Msg("  /abprofile 列表           列出本角色的所有配置")
+    ABP_Msg("  /abprofile on | off       开启/关闭插件（当前：" .. (ABP_Enabled == false and "关闭" or "开启") .. "）")
+    ABP_Msg("  /abprofile debug          诊断输出：关 / 按防抖窗口汇总（当前：" .. ABP_DebugLevel .. " 级）")
+    ABP_Msg("  /abprofile debug all      诊断输出：每条动作条事件都打印")
+    ABP_Msg("不带参数的 /abprofile 就是这份提示.")
+    ABP_Msg("ActionBarProfiles, 由Kronos的<Vanguard>制作, 60addons汉化")
+end
+
 -- 斜杠命令分发：解析"保存/加载/删除/列表 + 配置名"并调用对应函数
 function ABP_SlashCommand(msg)
     msg = msg or ""
-    if msg == "" then
-        ABP_Msg("ActionBarProfiles, 由Kronos的<Vanguard>制作, 60addons汉化")
-        ABP_Msg("/abprofile 保存 [配置文件名字]")
-        ABP_Msg("/abprofile 加载 [配置文件名字]")
-        ABP_Msg("/abprofile 删除 [配置文件名字]")
-        ABP_Msg("/abprofile 列表")
-        ABP_Msg("/abprofile debug")
-        ABP_Msg("/abprofile debug all (连每条动作条事件都打印)")
+
+    -- 去掉首尾空格：/abprofile 后面多打了空格也当成没带参数
+    local cmd = string.gsub(msg, "^%s*(.-)%s*$", "%1")
+    if cmd == "" then
+        ABP_PrintHelp()
+        return
+    end
+
+    local lowerCmd = string.lower(cmd)
+
+    -- 帮助别名
+    if lowerCmd == "?" or lowerCmd == "help" or cmd == "帮助" then
+        ABP_PrintHelp()
         return
     end
 
     -- 诊断开关：/abprofile debug（摘要），/abprofile debug all（每条事件都打印）
     -- 要求出现在命令开头，避免配置文件名字里含 debug 时误判
-    local lowerMsg = string.lower(msg)
-    if string.find(lowerMsg, "^%s*" .. CMD_DEBUG) then
-        if string.find(lowerMsg, "all", 1, true) then
+    if string.find(lowerCmd, "^%s*" .. CMD_DEBUG) then
+        if string.find(lowerCmd, "all", 1, true) then
             ABP_DebugLevel = 2
         else
             ABP_DebugLevel = (ABP_DebugLevel == 0) and 1 or 0
@@ -797,22 +862,36 @@ function ABP_SlashCommand(msg)
         return
     end
 
-    for profileName in string.gfind(msg, CMD_SAVE .. " (.*)") do
+    -- 插件开关：/abprofile on | /abprofile off
+    if string.find(lowerCmd, "^%s*off") then
+        ABP_SetEnabled(false)
+        return
+    end
+    if string.find(lowerCmd, "^%s*on") then
+        ABP_SetEnabled(true)
+        return
+    end
+
+    for profileName in string.gfind(cmd, CMD_SAVE .. " (.*)") do
         ABP_SaveProfile(profileName)
         return
     end
-    for profileName in string.gfind(msg, CMD_LOAD .. " (.*)") do
+    for profileName in string.gfind(cmd, CMD_LOAD .. " (.*)") do
         ABP_LoadProfile(profileName)
         return
     end
-    for profileName in string.gfind(msg, CMD_REMOVE .. " (.*)") do
+    for profileName in string.gfind(cmd, CMD_REMOVE .. " (.*)") do
         ABP_RemoveProfile(profileName)
         return
     end
-    if string.find(msg, CMD_LIST, 1, true) then
+    if string.find(cmd, CMD_LIST, 1, true) then
         ABP_ListProfiles()
         return
     end
+
+    -- 看不懂的命令：给提示，而不是静默什么都不做
+    ABP_Msg('无法识别的命令 "' .. cmd .. '"')
+    ABP_PrintHelp()
 end
 
 -- 构建小地图按钮的下拉菜单
@@ -912,6 +991,13 @@ function ABP_DropDownMenu_OnLoad()
         value = "Delete menu",
         notCheckable = 1,
         hasArrow = true,
+    }, UIDROPDOWNMENU_MENU_LEVEL)
+
+    UIDropDownMenu_AddButton({
+        text = ABP_Enabled and "关闭 ActionBarProfiles" or "开启 ActionBarProfiles",
+        func = function() ABP_SetEnabled(not ABP_Enabled) end,
+        notCheckable = 1,
+        owner = this:GetParent(),
     }, UIDROPDOWNMENU_MENU_LEVEL)
 end
 
